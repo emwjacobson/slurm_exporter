@@ -39,8 +39,11 @@ func GPUsGetMetrics() map[string]*GPUsMetrics {
 func ParseAllocatedGPUs() map[string]float64 {
 	gpu_map := make(map[string]float64)
 
-	args := []string{"-a", "-X", "--format=AllocTRES", "--state=RUNNING", "--noheader", "--parsable2"}
-	output := string(Execute("sacct", args))
+	// squeue --state RUNNING --noheader --Format=tres-alloc:.
+	args := []string{"--state=RUNNING", "--noheader", "--Format=tres-alloc:."}
+	output := string(Execute("squeue", args))
+	//args := []string{"-a", "-X", "--format=AllocTRES", "--state=RUNNING", "--noheader", "--parsable2"}
+	//output := string(Execute("sacct", args))
 
 	if len(output) == 0 {
 		return make(map[string]float64)
