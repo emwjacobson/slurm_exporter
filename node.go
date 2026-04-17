@@ -96,28 +96,30 @@ func ParseNodeMetrics(input []byte) map[string]*NodeMetrics {
 							  // "gpu:a100:8(IDX:0-7)" - multiple, contiguous
 							  // "gpu:ada6000:1(IDX:0)" - single
 							  // "gpu:k80:0(IDX:N/A)" - none
+							  // "gpu:ada6000:0" - weird state
 		
 		if (gpuTotalStr != "(null)") { // Has GPU
-			nodes[nodeName].hasGPU = true
 			gpu_str := strings.Split(gpuAllocStr, "(")
-			usedGPUs := strings.Split(gpu_str[0], ":") // gpu:a100:6
-			nodes[nodeName].gpuType = usedGPUs[1]
-
-			nodes[nodeName].gpuAlloc, _ = strconv.ParseUint(usedGPUs[2], 10, 64)
-			num_gpus, _ := strconv.ParseUint(strings.Split(gpuTotalStr, ":")[2], 10, 64)
-
-			// index_list = IDX:0,2-6
-						 // IDX:0,2-3,6
-						 // IDX:0-7
-						 // IDX:0
-						 // IDX:N/A
-			index_list := strings.TrimSuffix(gpu_str[1], ")")
-			index_list = strings.Split(index_list, ":")[1]
-
-			nodes[nodeName].gpuIndex = make([]int, num_gpus)
-			if (index_list != "N/A") {
-				for _, part := range strings.Split(index_list, ",") {
-					if strings.Contains(part, "-") {
+			if (len(gpu_str) >= 2) {
+				nodes[nodeName].hasGPU = true
+				usedGPUs := strings.Split(gpu_str[0], ":") // gpu:a100:6
+				nodes[nodeName].gpuType = usedGPUs[1]
+				
+				nodes[nodeName].gpuAlloc, _ = strconv.ParseUint(usedGPUs[2], 10, 64)
+				num_gpus, _ := strconv.ParseUint(strings.Split(gpuTotalStr, ":")[2], 10, 64)
+				
+				// index_list = IDX:0,2-6
+				// IDX:0,2-3,6
+				// IDX:0-7
+				// IDX:0
+				// IDX:N/A
+				index_list := strings.TrimSuffix(gpu_str[1], ")")
+				index_list = strings.Split(index_list, ":")[1]
+				
+				nodes[nodeName].gpuIndex = make([]int, num_gpus)
+				if (index_list != "N/A") {
+					for _, part := range strings.Split(index_list, ",") {
+						if strings.Contains(part, "-") {
 						// Range
 						bounds := strings.Split(part, "-")
 						start, _ := strconv.Atoi(bounds[0])
@@ -125,10 +127,11 @@ func ParseNodeMetrics(input []byte) map[string]*NodeMetrics {
 						for i := start; i <= end; i++ {
 							nodes[nodeName].gpuIndex[i] = 1
 						}
-					} else {
-						// Single Digit
-						num, _ := strconv.Atoi(part)
-						nodes[nodeName].gpuIndex[num] = 1
+						} else {
+							// Single Digit
+							num, _ := strconv.Atoi(part)
+							nodes[nodeName].gpuIndex[num] = 1
+						}
 					}
 				}
 			}
