@@ -29,6 +29,12 @@ type GPUsMetrics struct {
 	idle        float64
 	total       float64
 	utilization float64
+	partitions  []string
+}
+
+type nodeGPUData struct {
+	partitions []string
+	counts     map[string]float64 // gpu_type -> count
 }
 
 // Returns map of [node][gpu_type]GPUsMetrics
@@ -103,10 +109,10 @@ func ParseAllocatedGPUs() map[string]map[string]float64 {
 	return gpu_map
 }
 
-func ParseTotalGPUs() map[string]map[string]float64 {
-	gpu_map := make(map[string]map[string]float64)
+func ParseTotalGPUs() map[string]*nodeGPUData {
+	gpu_map := make(map[string]*nodeGPUData)
 
-	args := []string{"-h", "-o \"%n %G\""}
+	args := []string{"-h", "-o \"%n %R %G\""}
 	output := string(Execute("sinfo", args))
 
 	if len(output) == 0 {
@@ -120,53 +126,74 @@ func ParseTotalGPUs() map[string]map[string]float64 {
 
 		line = strings.Trim(line, "\"")
 		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		if len(fields) < 3 {
 			continue
 		}
 		nodeName := strings.Trim(fields[0], "\"")
-		gres := strings.Trim(fields[1], "\"")
+		partition := strings.Trim(strings.TrimRight(fields[1], "*"), "\"")
+		gres := strings.Trim(fields[2], "\"")
 
-		for _, resource := range strings.Split(gres, ",") {
-			if strings.HasPrefix(resource, "gpu:") {
-				// format: gpu:<type>:N(S:<something>), e.g. gpu:RTX2070:2(S:0)
-				parts := strings.Split(resource, ":")
-				if len(parts) < 3 {
-					continue
-				}
-				gpu_type := parts[1]
-				descriptor := strings.Split(parts[2], "(")[0]
-				count, _ := strconv.ParseFloat(descriptor, 64)
-
-				if gpu_map[nodeName] == nil {
-					gpu_map[nodeName] = make(map[string]float64)
-				}
-				gpu_map[nodeName][gpu_type] += count
+		nodeIsNew := false
+		if _, seen := gpu_map[nodeName]; !seen {
+			nodeIsNew = true
+			gpu_map[nodeName] = &nodeGPUData{
+				counts: make(map[string]float64),
 			}
+		}
+
+		// GPU counts are a property of the node, not the partition — add once.
+		if nodeIsNew {
+			for _, resource := range strings.Split(gres, ",") {
+				if strings.HasPrefix(resource, "gpu:") {
+					// format: gpu:<type>:N(S:<something>), e.g. gpu:RTX2070:2(S:0)
+					parts := strings.Split(resource, ":")
+					if len(parts) < 3 {
+						continue
+					}
+					gpu_type := parts[1]
+					descriptor := strings.Split(parts[2], "(")[0]
+					count, _ := strconv.ParseFloat(descriptor, 64)
+					gpu_map[nodeName].counts[gpu_type] += count
+				}
+			}
+		}
+
+		// Track every distinct partition this node belongs to.
+		partitionSeen := false
+		for _, p := range gpu_map[nodeName].partitions {
+			if p == partition {
+				partitionSeen = true
+				break
+			}
+		}
+		if !partitionSeen {
+			gpu_map[nodeName].partitions = append(gpu_map[nodeName].partitions, partition)
 		}
 	}
 
 	return gpu_map
 }
 
-// slurm_gpus_alloc{type="k80",node="gpu01"} 4
-// slurm_gpus_idle{type="k80",node="gpu01"} 20
-// slurm_gpus_total{type="k80",node="gpu01"} 24
-// slurm_gpus_utilization{type="k80",node="gpu01"} 0.16666
+// slurm_gpus_alloc{type="k80",node="gpu01",partition="gpu"} 4
+// slurm_gpus_idle{type="k80",node="gpu01",partition="gpu"} 20
+// slurm_gpus_total{type="k80",node="gpu01",partition="gpu"} 24
+// slurm_gpus_utilization{type="k80",node="gpu01",partition="gpu"} 0.16666
 func ParseGPUsMetrics() map[string]map[string]*GPUsMetrics {
 	metrics := make(map[string]map[string]*GPUsMetrics)
 
 	totals := ParseTotalGPUs()
 	alloc := ParseAllocatedGPUs()
 
-	for node, typeMap := range totals {
+	for node, nodeData := range totals {
 		metrics[node] = make(map[string]*GPUsMetrics)
-		for gpu_type, total := range typeMap {
+		for gpu_type, total := range nodeData.counts {
 			allocCount := alloc[node][gpu_type]
 			metrics[node][gpu_type] = &GPUsMetrics{
 				alloc:       allocCount,
 				idle:        total - allocCount,
 				total:       total,
 				utilization: allocCount / total,
+				partitions:  nodeData.partitions,
 			}
 		}
 	}
@@ -198,21 +225,30 @@ func Execute(command string, arguments []string) []byte {
  */
 
 func NewGPUsCollector() *GPUsCollector {
-	labels := []string{"type", "node"}
+	nodeLabels := []string{"type", "node"}
+	partLabels := []string{"type", "partition"}
 
 	return &GPUsCollector{
-		alloc:       prometheus.NewDesc("slurm_gpus_alloc", "Allocated GPUs by type", labels, nil),
-		idle:        prometheus.NewDesc("slurm_gpus_idle", "Idle GPUs by type", labels, nil),
-		total:       prometheus.NewDesc("slurm_gpus_total", "Total GPUs by type", labels, nil),
-		utilization: prometheus.NewDesc("slurm_gpus_utilization", "Total GPU utilization by type", labels, nil),
+		alloc:            prometheus.NewDesc("slurm_gpus_alloc", "Allocated GPUs by type and node", nodeLabels, nil),
+		idle:             prometheus.NewDesc("slurm_gpus_idle", "Idle GPUs by type and node", nodeLabels, nil),
+		total:            prometheus.NewDesc("slurm_gpus_total", "Total GPUs by type and node", nodeLabels, nil),
+		utilization:      prometheus.NewDesc("slurm_gpus_utilization", "GPU utilization by type and node", nodeLabels, nil),
+		partitionAlloc:   prometheus.NewDesc("slurm_gpus_partition_alloc", "Allocated GPUs by type and partition", partLabels, nil),
+		partitionIdle:    prometheus.NewDesc("slurm_gpus_partition_idle", "Idle GPUs by type and partition", partLabels, nil),
+		partitionTotal:   prometheus.NewDesc("slurm_gpus_partition_total", "Total GPUs by type and partition", partLabels, nil),
+		partitionUtil:    prometheus.NewDesc("slurm_gpus_partition_utilization", "GPU utilization by type and partition", partLabels, nil),
 	}
 }
 
 type GPUsCollector struct {
-	alloc       *prometheus.Desc
-	idle        *prometheus.Desc
-	total       *prometheus.Desc
-	utilization *prometheus.Desc
+	alloc          *prometheus.Desc
+	idle           *prometheus.Desc
+	total          *prometheus.Desc
+	utilization    *prometheus.Desc
+	partitionAlloc *prometheus.Desc
+	partitionIdle  *prometheus.Desc
+	partitionTotal *prometheus.Desc
+	partitionUtil  *prometheus.Desc
 }
 
 // Send all metric descriptions
@@ -221,15 +257,43 @@ func (cc *GPUsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- cc.idle
 	ch <- cc.total
 	ch <- cc.utilization
+	ch <- cc.partitionAlloc
+	ch <- cc.partitionIdle
+	ch <- cc.partitionTotal
+	ch <- cc.partitionUtil
 }
+
 func (cc *GPUsCollector) Collect(ch chan<- prometheus.Metric) {
 	cm := GPUsGetMetrics()
+
+	type partKey struct{ gpuType, partition string }
+	type partTotals struct{ alloc, idle, total float64 }
+	byPartition := make(map[partKey]*partTotals)
+
 	for node, typeMap := range cm {
 		for gpu_type, m := range typeMap {
 			ch <- prometheus.MustNewConstMetric(cc.alloc, prometheus.GaugeValue, m.alloc, gpu_type, node)
 			ch <- prometheus.MustNewConstMetric(cc.idle, prometheus.GaugeValue, m.idle, gpu_type, node)
 			ch <- prometheus.MustNewConstMetric(cc.total, prometheus.GaugeValue, m.total, gpu_type, node)
 			ch <- prometheus.MustNewConstMetric(cc.utilization, prometheus.GaugeValue, m.utilization, gpu_type, node)
+
+			for _, partition := range m.partitions {
+				key := partKey{gpu_type, partition}
+				if byPartition[key] == nil {
+					byPartition[key] = &partTotals{}
+				}
+				byPartition[key].alloc += m.alloc
+				byPartition[key].idle += m.idle
+				byPartition[key].total += m.total
+			}
 		}
+	}
+
+	for key, pt := range byPartition {
+		util := pt.alloc / pt.total
+		ch <- prometheus.MustNewConstMetric(cc.partitionAlloc, prometheus.GaugeValue, pt.alloc, key.gpuType, key.partition)
+		ch <- prometheus.MustNewConstMetric(cc.partitionIdle, prometheus.GaugeValue, pt.idle, key.gpuType, key.partition)
+		ch <- prometheus.MustNewConstMetric(cc.partitionTotal, prometheus.GaugeValue, pt.total, key.gpuType, key.partition)
+		ch <- prometheus.MustNewConstMetric(cc.partitionUtil, prometheus.GaugeValue, util, key.gpuType, key.partition)
 	}
 }
