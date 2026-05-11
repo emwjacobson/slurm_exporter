@@ -194,3 +194,145 @@ func (cc *GPUsCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(cc.utilization, prometheus.GaugeValue, float64(cm[gpu_type].utilization), gpu_type)
 	}
 }
+
+func ParsePartitionTotalGPUs() map[string]map[string]float64 {
+	result := make(map[string]map[string]float64)
+
+	args := []string{"-h", "-o", "%R %n %G"}
+	output := string(Execute("sinfo", args))
+
+	if len(output) == 0 {
+		return result
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		if len(line) == 0 {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		partition := fields[0]
+		gres := fields[2]
+
+		if !strings.HasPrefix(gres, "gpu:") {
+			continue
+		}
+		// format: gpu:<type>:<count> or gpu:<type>:<count>(S:...)
+		parts := strings.Split(gres, ":")
+		if len(parts) < 3 {
+			continue
+		}
+		gpuType := parts[1]
+		countStr := strings.Split(parts[2], "(")[0]
+		count, _ := strconv.ParseFloat(countStr, 64)
+
+		if result[partition] == nil {
+			result[partition] = make(map[string]float64)
+		}
+		result[partition][gpuType] += count
+	}
+	return result
+}
+
+func ParsePartitionAllocatedGPUs() map[string]map[string]float64 {
+	result := make(map[string]map[string]float64)
+
+	args := []string{"--state=RUNNING", "--noheader", "--Format=partition,tres-alloc:."}
+	output := string(Execute("squeue", args))
+
+	if len(output) == 0 {
+		return result
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		if len(line) == 0 {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		partition := fields[0]
+		tres := fields[1]
+
+		for _, resource := range strings.Split(tres, ",") {
+			if strings.HasPrefix(resource, "gres/gpu:") {
+				descriptor := strings.TrimPrefix(resource, "gres/gpu:")
+				parts := strings.Split(descriptor, "=")
+				if len(parts) < 2 {
+					continue
+				}
+				gpuType := parts[0]
+				count, _ := strconv.ParseFloat(parts[1], 64)
+
+				if result[partition] == nil {
+					result[partition] = make(map[string]float64)
+				}
+				result[partition][gpuType] += count
+			}
+		}
+	}
+	return result
+}
+
+func ParsePartitionGPUsMetrics() map[string]map[string]*GPUsMetrics {
+	result := make(map[string]map[string]*GPUsMetrics)
+
+	totals := ParsePartitionTotalGPUs()
+	allocs := ParsePartitionAllocatedGPUs()
+
+	for partition, gpuTypes := range totals {
+		result[partition] = make(map[string]*GPUsMetrics)
+		for gpuType, total := range gpuTypes {
+			allocated := float64(0)
+			if allocs[partition] != nil {
+				allocated = allocs[partition][gpuType]
+			}
+			result[partition][gpuType] = &GPUsMetrics{
+				alloc:       allocated,
+				idle:        total - allocated,
+				total:       total,
+				utilization: allocated / total,
+			}
+		}
+	}
+	return result
+}
+
+func NewPartitionGPUsCollector() *PartitionGPUsCollector {
+	labels := []string{"partition", "type"}
+	return &PartitionGPUsCollector{
+		alloc:       prometheus.NewDesc("slurm_partition_gpus_alloc", "Allocated GPUs by partition and type", labels, nil),
+		idle:        prometheus.NewDesc("slurm_partition_gpus_idle", "Idle GPUs by partition and type", labels, nil),
+		total:       prometheus.NewDesc("slurm_partition_gpus_total", "Total GPUs by partition and type", labels, nil),
+		utilization: prometheus.NewDesc("slurm_partition_gpus_utilization", "GPU utilization by partition and type", labels, nil),
+	}
+}
+
+type PartitionGPUsCollector struct {
+	alloc       *prometheus.Desc
+	idle        *prometheus.Desc
+	total       *prometheus.Desc
+	utilization *prometheus.Desc
+}
+
+func (c *PartitionGPUsCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.alloc
+	ch <- c.idle
+	ch <- c.total
+	ch <- c.utilization
+}
+
+func (c *PartitionGPUsCollector) Collect(ch chan<- prometheus.Metric) {
+	metrics := ParsePartitionGPUsMetrics()
+	for partition, gpuTypes := range metrics {
+		for gpuType, m := range gpuTypes {
+			ch <- prometheus.MustNewConstMetric(c.alloc, prometheus.GaugeValue, m.alloc, partition, gpuType)
+			ch <- prometheus.MustNewConstMetric(c.idle, prometheus.GaugeValue, m.idle, partition, gpuType)
+			ch <- prometheus.MustNewConstMetric(c.total, prometheus.GaugeValue, m.total, partition, gpuType)
+			ch <- prometheus.MustNewConstMetric(c.utilization, prometheus.GaugeValue, m.utilization, partition, gpuType)
+		}
+	}
+}
